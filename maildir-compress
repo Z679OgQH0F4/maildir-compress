@@ -1,0 +1,380 @@
+#!/usr/bin/env perl
+
+# $URL: https://svn.mediatemple.net/dev/apps/maildir-compress/maildir-compress $
+# $Rev: 127578 $
+
+use strict;
+use warnings;
+
+use Carp;
+use Config;
+use English qw( -no_match_vars );
+use Fcntl qw(:mode);
+use File::Spec::Functions;
+use File::Temp qw( tempdir );
+use Getopt::Long;
+use IO::Compress::Bzip2 qw(bzip2 $Bzip2Error);
+use IPC::Open3 qw(open3);
+use Log::Log4perl qw(:easy);
+use Readonly;
+
+# More or less #include <signal.h>
+defined( $Config{sig_name} ) || croak 'No signals defined?';
+
+my @signame = split q{ }, $Config{sig_name};
+my %signo;
+@signo{@signame} = ( 0 .. $#signame );
+
+Log::Log4perl->easy_init($INFO);
+my $logger = Log::Log4perl::get_logger();
+
+my $block_size = 0;    # To override the block size returned by stat(2).
+
+my $result = GetOptions( 'block-size=i' => \$block_size, );
+
+my $exit_status = 0;
+
+foreach (@ARGV) {
+    if ( maildir_compress( File::Spec->rel2abs($_) ) ) {
+        $exit_status = 1;
+    }
+}
+
+exit $exit_status;
+
+# Compress the contents of a Maildir.
+
+sub maildir_compress {
+    my $maildir = shift;
+
+    if ( !maildir_check($maildir) ) {
+        $logger->log( $WARN, "$maildir does not seem to be a valid maildir, not compressing" );
+        return;
+    }
+
+    # If this is the top level maildir, each .Something directory
+    # might also be a maildir.
+
+    my ( $volume, $directories, $file ) = File::Spec->splitpath($maildir);
+    if ( $file eq 'Maildir' ) {
+
+        my $mdh;
+        if ( !opendir $mdh, $maildir ) {
+            $logger->log( $ERROR, "opendir failed for $maildir" );
+            return;
+        }
+        while ( my $df = readdir $mdh ) {
+            if ( ( $df eq q{.} ) or ( $df eq q{..} ) ) {
+                next;
+            }
+
+            if ( ( $df eq 'new' ) or ( $df eq 'cur' ) or ( $df eq 'tmp' ) ) {
+                next;
+            }
+
+            if ( !( $df =~ / \A \. /msx ) ) {
+                $logger->log( $DEBUG, "$df doesn't start with a dot, so it can't be a subfolder" );
+                next;
+            }
+
+            my $subdir = catfile( $maildir, $df );
+
+            # skip non-directories
+            if ( !-d $subdir ) {
+                $logger->log( $DEBUG, "skipping non-directory $subdir" );
+                next;
+            }
+
+            $logger->log( $INFO, "maildir_compress of subfolder $subdir" );
+            maildir_compress($subdir);
+        }
+        closedir $mdh;
+    }
+
+    # for each (email) file in maildir/cur
+    my $cur = catfile( $maildir, 'cur' );
+    my $cdh;
+    if ( !opendir $cdh, $cur ) {
+        $logger->log( $ERROR, "opendir failed for $cur" );
+        return;
+    }
+    while ( my $mf = readdir $cdh ) {
+        if ( ( $mf eq q{.} ) or ( $mf eq q{..} ) ) {
+            next;
+        }
+
+        email_compress( catfile( $cur, $mf ), $maildir );
+    }
+    closedir $cdh;
+
+    # for each (email) file in maildir/new
+    my $new = catfile( $maildir, 'new' );
+    my $ndh;
+    if ( !opendir $ndh, $new ) {
+        $logger->log( $ERROR, "opendir failed for $new" );
+        return;
+    }
+    while ( my $mf = readdir $ndh ) {
+        if ( ( $mf eq q{.} ) or ( $mf eq q{..} ) ) {
+            next;
+        }
+
+        email_compress( catfile( $new, $mf ), $maildir );
+    }
+    closedir $ndh;
+
+    return 1;
+}
+
+# Compress an email file.
+
+sub email_compress {
+    my $mailfile = shift;
+    my $maildir  = shift;
+
+    my ( $volume, $directories, $file ) = File::Spec->splitpath($mailfile);
+
+    my ( $name_no_flags, $flags ) = $file =~ / ([^:]+) :2, (.*) /msx;
+
+    if ( !$name_no_flags ) {
+        $logger->log( $WARN, "unable to parse $file as a maildir file name, not compressing" );
+        return;
+    }
+
+    my ($dev, $ino,   $mode,  $nlink, $uid,     $gid, $rdev,
+        $sz,  $atime, $mtime, $ctime, $blksize, $blocks
+    ) = stat $mailfile;
+
+    if ( !$dev ) {
+        $logger->log( $ERROR, "Unable to stat $mailfile: $OS_ERROR" );
+        return;
+    }
+
+    if ( !( $mode & S_IFREG ) ) {
+        $logger->log( $DEBUG, "skipping non-file $mailfile" );
+        return;
+    }
+
+    # If the file is already compressed or otherwise unreadable, skip it.
+    if ( is_compressed($mailfile) ) {
+        return;
+    }
+
+    my $size;
+    if ( $name_no_flags =~ / ,S=(\d+) /msx ) {
+        $size = $1;
+        if ( $size > $sz ) {    # Probably already compressed in some unknown way?
+            $logger->log( $WARN,
+                "actual size of $sz is less than S=n size of $size, not compressing" );
+            return;
+        }
+    }
+    else {
+        $size = $sz;
+
+        # rename the file to include the size...
+        my $newmailfile
+            = catfile( $volume, $directories, $name_no_flags . ',S=' . $size . ':2,' . $flags );
+        if ( !rename $mailfile, $newmailfile ) {
+            $logger->log( $ERROR, "unable to rename $mailfile to $newmailfile: $OS_ERROR" );
+            return;
+        }
+        $logger->log( $INFO, "renamed '$mailfile' to '$newmailfile'" );
+        $mailfile = $newmailfile;
+        ( $volume, $directories, $file ) = File::Spec->splitpath($newmailfile);
+    }
+
+    # Check that compressing this file is worth it at all
+    if ( $block_size == 0 ) {
+        $block_size = $blksize;
+    }
+    if ( $size <= $block_size ) {
+        $logger->log( $INFO,
+            "$mailfile size of $size is less than the file system block size $block_size, not compressing"
+        );
+        return;
+    }
+
+    my $tempdir = tempdir(
+        CLEANUP => 1,
+        DIR     => catfile( $volume, $directories )
+    );
+
+    if ( !$tempdir ) {
+        $logger->log( $ERROR, "unable to create temporary directory: $OS_ERROR" );
+        return;
+    }
+
+    my $compressed_file = catfile( $tempdir, $file );
+
+    bzip2 $mailfile => $compressed_file, BlockSize100K => 6;
+    if ( !$mailfile ) {
+        $logger->log( $ERROR, "Unable to create compressed file: $Bzip2Error" );
+        return;
+    }
+
+    # set owner, mode and times on $compressed_file
+
+    if ( !chown $uid, $gid, $compressed_file ) {
+        $logger->log( $ERROR, "Unable to chown $mailfile: $OS_ERROR" );
+        return;
+    }
+    if ( !chmod $mode, $compressed_file ) {
+        $logger->log( $ERROR, "Unable to chmod $mailfile: $OS_ERROR" );
+        return;
+    }
+    if ( !utime $atime, $mtime, $compressed_file ) {
+        $logger->log( $ERROR, "Unable to utime $mailfile: $OS_ERROR" );
+        return;
+    }
+
+    # Lock the maildir
+    my $pid = maildir_lock($maildir);
+    if ( !$pid ) {
+        $logger->log( $ERROR, "$maildir can't be locked, not compressing $mailfile" );
+        return;
+    }
+
+    $logger->log( $DEBUG, "successfully locked $maildir" );
+
+    # After this point, we must kill the process holding the lock before we return.
+
+    if ( !-f $mailfile ) {
+        $logger->log( $WARN, "original mailfile $mailfile is now gone, skipping" );
+    }
+    else {
+        if ( !rename $compressed_file, $mailfile ) {
+            $logger->log( $ERROR, "unable to rename $compressed_file to $mailfile: $OS_ERROR" );
+        }
+        else {
+            $logger->log( $INFO, "$mailfile is now compressed" );
+        }
+    }
+
+    $logger->log( $DEBUG, "killing $pid" );
+    kill $signo{TERM}, $pid;
+
+    if ( !rmdir $tempdir ) {
+        $logger->log( $ERROR, "failed to remove $tempdir: $OS_ERROR" );
+    }
+}
+
+# Check a file to see if it's compressed already, or otherwise inaccessible.
+
+sub is_compressed {
+    my $mailfile = shift;
+
+    my $fh;
+    if ( !open $fh, '<', $mailfile ) {
+        $logger->log( $ERROR, "Can't open $mailfile: $OS_ERROR" );
+        return 1;
+    }
+    binmode $fh;
+
+    my $magic;
+    if ( !sysread $fh, $magic, 2 ) {
+        $logger->log( $ERROR, "Can't read magic number from $mailfile: $OS_ERROR" );
+        return 1;
+    }
+
+    # File is Bzip2 compressed, so our work is done
+    if ( $magic eq 'BZ' ) {
+        $logger->log( $INFO, "Skipping bzip compressed file $mailfile" );
+        return 1;
+    }
+
+    # File is gzip compressed, so our work is done
+    if ( $magic eq "\x1f\x8b" ) {
+        $logger->log( $INFO, "Skipping gzip compressed file $mailfile" );
+        return 1;
+    }
+
+    return;
+}
+
+# Make sure this maildir looks like a real (dovecot) maildir.
+
+sub maildir_check {
+    my $maildir = shift;
+
+    if ( !-d $maildir ) {
+        $logger->log( $INFO, "$maildir is not a directory" );
+        return;
+    }
+
+    # Check for cur, new and tmp subdirectories
+
+    if ( !-d catfile( $maildir, 'cur' ) ) {
+        $logger->log( $WARN, "$maildir has no 'cur' subdirectory, not compressing" );
+        return;
+    }
+    if ( !-d catfile( $maildir, 'new' ) ) {
+        $logger->log( $WARN, "$maildir has no 'new' subdirectory, not compressing" );
+        return;
+    }
+    if ( !-d catfile( $maildir, 'tmp' ) ) {
+        $logger->log( $WARN, "$maildir has no 'tmp' subdirectory, not compressing" );
+        return;
+    }
+
+    # Check for dovecot uid list
+
+    if ( !-f catfile( $maildir, 'dovecot-uidlist' ) ) {
+
+        # Suspicious, but not fatal.
+        $logger->log( $INFO, "$maildir does not contain a dovecot-uidlist file" );
+    }
+
+    $logger->log( $DEBUG, "$maildir looks like a Maildir" );
+    return 1;
+}
+
+# Lock this maildir and return the PID of the process holding the lock
+# for us.  Return undef if we can't get the lock.
+
+sub maildir_lock {
+    my $maildir = shift;
+
+    my $cmd_input  = q{};
+    my $cmd_output = q{};
+    my $cmd_error  = Symbol::gensym;
+
+    my $cmd = "/usr/libexec/dovecot/maildirlock '$maildir' 3";
+
+    my $pid = open3( $cmd_input, $cmd_output, $cmd_error, $cmd );
+
+    if ( waitpid( $pid, 0 ) != $pid ) {
+        $logger->log( $ERROR, "waiting for $pid, but it's already gone" );
+        return;
+    }
+
+    my $child_exit_status = $CHILD_ERROR >> 8;
+
+    if ($child_exit_status) {
+
+        # At this point, we might want to check if the lock is stale,
+        # this is an optimization.
+
+        my $err = q{};
+        while (<$cmd_error>) {
+            $err = $err . $_;
+        }
+
+        $logger->log( $WARN, "Can't get lock, $child_exit_status return from command: $cmd: $err" );
+        return;
+    }
+
+    my $output;
+    while (<$cmd_output>) {
+        $output = $output . $_;
+    }
+    chomp $output;
+
+    my ($pid_out) = $output =~ / \A (\d+) \z /msx;
+    if ( !$pid_out ) {
+        $logger->log( $WARN, "Can't get PID from maildirlock output '$output'" );
+        return;
+    }
+
+    return $pid_out;
+}

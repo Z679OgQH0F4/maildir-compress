@@ -1,0 +1,36 @@
+# $URL: https://svn.mediatemple.net/dev/apps/maildir-compress/REDHAT.spec.in $
+# $Id: REDHAT.spec.in 121208 2011-07-26 13:56:58Z gene $
+
+%define _topdir	 	%(echo $PWD)/rpm
+%define name		@PACKAGE_NAME@
+%define release		1
+%define version 	@PACKAGE_VERSION@
+%define buildroot %{_topdir}/%{name}-%{version}-root
+
+BuildArch:		noarch
+BuildRoot:	 	%{buildroot}
+Summary: 		maildir-compress - Compress mail files for dovecot zlib plugin
+License: 		GPL3+
+Name: 			%{name}
+Version: 		%{version}
+Release: 		1%{?dist}
+Source: 		%{name}-%{version}.tar.gz
+Prefix: 		/opt/mt
+Group: 			Applications/System
+
+%description
+maildir-compress - Compress mail files in a maildir for dovecot zlib plugin
+
+%prep
+%setup -q
+
+%build
+./configure
+make
+
+%install
+make install prefix=$RPM_BUILD_ROOT/opt/mt
+
+%files
+%defattr(-,root,root)
+/opt/mt/bin
