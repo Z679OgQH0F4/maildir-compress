@@ -1,8 +1,5 @@
 #!/usr/bin/env perl
 
-# $URL: https://svn.mediatemple.net/dev/apps/maildir-compress/maildir-compress $
-# $Rev: 127578 $
-
 =head1 LICENSE
 
 Copyright (C) 2011, Media Temple
