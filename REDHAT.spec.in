@@ -10,7 +10,7 @@
 BuildArch:		noarch
 BuildRoot:	 	%{buildroot}
 Summary: 		maildir-compress - Compress mail files for dovecot zlib plugin
-License: 		GPL3+
+License: 		Artistic 2.0
 Name: 			%{name}
 Version: 		%{version}
 Release: 		1%{?dist}

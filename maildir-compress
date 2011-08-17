@@ -28,7 +28,7 @@ use File::Temp qw( tempdir );
 use Getopt::Long;
 use IO::Compress::Bzip2 qw(bzip2 $Bzip2Error);
 use IPC::Open3 qw(open3);
-use Log::Log4perl qw(:easy);
+use Log::Log4perl;
 use Readonly;
 
 # More or less #include <signal.h>
@@ -38,8 +38,25 @@ my @signame = split q{ }, $Config{sig_name};
 my %signo;
 @signo{@signame} = ( 0 .. $#signame );
 
-Log::Log4perl->easy_init($INFO);
-my $logger = Log::Log4perl::get_logger();
+# Initialize Logger
+my $log_conf = q(
+    log4perl.rootLogger                = DEBUG, SCREEN, SYSLOG
+
+    log4perl.appender.SCREEN           = Log::Log4perl::Appender::Screen
+    log4perl.appender.SCREEN.stderr    = 0
+    log4perl.appender.SCREEN.layout    = Log::Log4perl::Layout::PatternLayout
+    log4perl.appender.SCREEN.layout.ConversionPattern = %F:%L: %d{ISO8601} %m %n
+
+    log4perl.appender.SYSLOG           = Log::Dispatch::Syslog
+    log4perl.appender.SYSLOG.min_level = debug
+    log4perl.appender.SYSLOG.ident     = maildir-compress
+    log4perl.appender.SYSLOG.facility  = daemon
+    log4perl.appender.SYSLOG.layout    = Log::Log4perl::Layout::PatternLayout
+    log4perl.appender.SYSLOG.layout.ConversionPattern = %m %n
+);
+
+Log::Log4perl::init( \$log_conf );
+my $logger = Log::Log4perl->get_logger();
 
 my $block_size = 0;    # To override the block size returned by stat(2).
 
@@ -61,7 +78,7 @@ sub maildir_compress {
     my $maildir = shift;
 
     if ( !maildir_check($maildir) ) {
-        $logger->log( $WARN, "$maildir does not seem to be a valid maildir, not compressing" );
+        $logger->warn("$maildir does not seem to be a valid maildir, not compressing");
         return;
     }
 
@@ -73,7 +90,7 @@ sub maildir_compress {
 
         my $mdh;
         if ( !opendir $mdh, $maildir ) {
-            $logger->log( $ERROR, "opendir failed for $maildir" );
+            $logger->error("opendir failed for $maildir");
             return;
         }
         while ( my $df = readdir $mdh ) {
@@ -86,7 +103,7 @@ sub maildir_compress {
             }
 
             if ( !( $df =~ / \A \. /msx ) ) {
-                $logger->log( $DEBUG, "$df doesn't start with a dot, so it can't be a subfolder" );
+                $logger->debug("$df doesn't start with a dot, so it can't be a subfolder");
                 next;
             }
 
@@ -94,11 +111,11 @@ sub maildir_compress {
 
             # skip non-directories
             if ( !-d $subdir ) {
-                $logger->log( $DEBUG, "skipping non-directory $subdir" );
+                $logger->debug("skipping non-directory $subdir");
                 next;
             }
 
-            $logger->log( $INFO, "maildir_compress of subfolder $subdir" );
+            $logger->info("maildir_compress of subfolder $subdir");
             maildir_compress($subdir);
         }
         closedir $mdh;
@@ -108,7 +125,7 @@ sub maildir_compress {
     my $cur = catfile( $maildir, 'cur' );
     my $cdh;
     if ( !opendir $cdh, $cur ) {
-        $logger->log( $ERROR, "opendir failed for $cur" );
+        $logger->error("opendir failed for $cur");
         return;
     }
     while ( my $mf = readdir $cdh ) {
@@ -124,7 +141,7 @@ sub maildir_compress {
     my $new = catfile( $maildir, 'new' );
     my $ndh;
     if ( !opendir $ndh, $new ) {
-        $logger->log( $ERROR, "opendir failed for $new" );
+        $logger->error("opendir failed for $new");
         return;
     }
     while ( my $mf = readdir $ndh ) {
@@ -150,7 +167,7 @@ sub email_compress {
     my ( $name_no_flags, $flags ) = $file =~ / ([^:]+) :2, (.*) /msx;
 
     if ( !$name_no_flags ) {
-        $logger->log( $WARN, "unable to parse $file as a maildir file name, not compressing" );
+        $logger->warn("unable to parse $file as a maildir file name, not compressing");
         return;
     }
 
@@ -159,12 +176,12 @@ sub email_compress {
     ) = stat $mailfile;
 
     if ( !$dev ) {
-        $logger->log( $ERROR, "Unable to stat $mailfile: $OS_ERROR" );
+        $logger->error("Unable to stat $mailfile: $OS_ERROR");
         return;
     }
 
     if ( !( $mode & S_IFREG ) ) {
-        $logger->log( $DEBUG, "skipping non-file $mailfile" );
+        $logger->debug("skipping non-file $mailfile");
         return;
     }
 
@@ -177,8 +194,7 @@ sub email_compress {
     if ( $name_no_flags =~ / ,S=(\d+) /msx ) {
         $size = $1;
         if ( $size > $sz ) {    # Probably already compressed in some unknown way?
-            $logger->log( $WARN,
-                "actual size of $sz is less than S=n size of $size, not compressing" );
+            $logger->warn("actual size of $sz is less than S=n size of $size, not compressing");
             return;
         }
     }
@@ -189,10 +205,10 @@ sub email_compress {
         my $newmailfile
             = catfile( $volume, $directories, $name_no_flags . ',S=' . $size . ':2,' . $flags );
         if ( !rename $mailfile, $newmailfile ) {
-            $logger->log( $ERROR, "unable to rename $mailfile to $newmailfile: $OS_ERROR" );
+            $logger->error("unable to rename $mailfile to $newmailfile: $OS_ERROR");
             return;
         }
-        $logger->log( $INFO, "renamed '$mailfile' to '$newmailfile'" );
+        $logger->info("renamed '$mailfile' to '$newmailfile'");
         $mailfile = $newmailfile;
         ( $volume, $directories, $file ) = File::Spec->splitpath($newmailfile);
     }
@@ -202,7 +218,7 @@ sub email_compress {
         $block_size = $blksize;
     }
     if ( $size <= $block_size ) {
-        $logger->log( $INFO,
+        $logger->info(
             "$mailfile size of $size is less than the file system block size $block_size, not compressing"
         );
         return;
@@ -214,7 +230,7 @@ sub email_compress {
     );
 
     if ( !$tempdir ) {
-        $logger->log( $ERROR, "unable to create temporary directory: $OS_ERROR" );
+        $logger->error("unable to create temporary directory: $OS_ERROR");
         return;
     }
 
@@ -222,53 +238,53 @@ sub email_compress {
 
     bzip2 $mailfile => $compressed_file, BlockSize100K => 6;
     if ( !$mailfile ) {
-        $logger->log( $ERROR, "Unable to create compressed file: $Bzip2Error" );
+        $logger->errir("Unable to create compressed file: $Bzip2Error");
         return;
     }
 
     # set owner, mode and times on $compressed_file
 
     if ( !chown $uid, $gid, $compressed_file ) {
-        $logger->log( $ERROR, "Unable to chown $mailfile: $OS_ERROR" );
+        $logger->error("Unable to chown $mailfile: $OS_ERROR");
         return;
     }
     if ( !chmod $mode, $compressed_file ) {
-        $logger->log( $ERROR, "Unable to chmod $mailfile: $OS_ERROR" );
+        $logger->error("Unable to chmod $mailfile: $OS_ERROR");
         return;
     }
     if ( !utime $atime, $mtime, $compressed_file ) {
-        $logger->log( $ERROR, "Unable to utime $mailfile: $OS_ERROR" );
+        $logger->error("Unable to utime $mailfile: $OS_ERROR");
         return;
     }
 
     # Lock the maildir
     my $pid = maildir_lock($maildir);
     if ( !$pid ) {
-        $logger->log( $ERROR, "$maildir can't be locked, not compressing $mailfile" );
+        $logger->error("$maildir can't be locked, not compressing $mailfile");
         return;
     }
 
-    $logger->log( $DEBUG, "successfully locked $maildir" );
+    $logger->debug("successfully locked $maildir");
 
     # After this point, we must kill the process holding the lock before we return.
 
     if ( !-f $mailfile ) {
-        $logger->log( $WARN, "original mailfile $mailfile is now gone, skipping" );
+        $logger->warn("original mailfile $mailfile is now gone, skipping");
     }
     else {
         if ( !rename $compressed_file, $mailfile ) {
-            $logger->log( $ERROR, "unable to rename $compressed_file to $mailfile: $OS_ERROR" );
+            $logger->error("unable to rename $compressed_file to $mailfile: $OS_ERROR");
         }
         else {
-            $logger->log( $INFO, "$mailfile is now compressed" );
+            $logger->info("$mailfile is now compressed");
         }
     }
 
-    $logger->log( $DEBUG, "killing $pid" );
+    $logger->debug("killing $pid");
     kill $signo{TERM}, $pid;
 
     if ( !rmdir $tempdir ) {
-        $logger->log( $ERROR, "failed to remove $tempdir: $OS_ERROR" );
+        $logger->error("failed to remove $tempdir: $OS_ERROR");
     }
 }
 
@@ -279,26 +295,26 @@ sub is_compressed {
 
     my $fh;
     if ( !open $fh, '<', $mailfile ) {
-        $logger->log( $ERROR, "Can't open $mailfile: $OS_ERROR" );
+        $logger->error("Can't open $mailfile: $OS_ERROR");
         return 1;
     }
     binmode $fh;
 
     my $magic;
     if ( !sysread $fh, $magic, 2 ) {
-        $logger->log( $ERROR, "Can't read magic number from $mailfile: $OS_ERROR" );
+        $logger->error("Can't read magic number from $mailfile: $OS_ERROR");
         return 1;
     }
 
     # File is Bzip2 compressed, so our work is done
     if ( $magic eq 'BZ' ) {
-        $logger->log( $INFO, "Skipping bzip compressed file $mailfile" );
+        $logger->info("Skipping bzip compressed file $mailfile");
         return 1;
     }
 
     # File is gzip compressed, so our work is done
     if ( $magic eq "\x1f\x8b" ) {
-        $logger->log( $INFO, "Skipping gzip compressed file $mailfile" );
+        $logger->info("Skipping gzip compressed file $mailfile");
         return 1;
     }
 
@@ -311,22 +327,22 @@ sub maildir_check {
     my $maildir = shift;
 
     if ( !-d $maildir ) {
-        $logger->log( $INFO, "$maildir is not a directory" );
+        $logger->info("$maildir is not a directory");
         return;
     }
 
     # Check for cur, new and tmp subdirectories
 
     if ( !-d catfile( $maildir, 'cur' ) ) {
-        $logger->log( $WARN, "$maildir has no 'cur' subdirectory, not compressing" );
+        $logger->warn("$maildir has no 'cur' subdirectory, not compressing");
         return;
     }
     if ( !-d catfile( $maildir, 'new' ) ) {
-        $logger->log( $WARN, "$maildir has no 'new' subdirectory, not compressing" );
+        $logger->warn("$maildir has no 'new' subdirectory, not compressing");
         return;
     }
     if ( !-d catfile( $maildir, 'tmp' ) ) {
-        $logger->log( $WARN, "$maildir has no 'tmp' subdirectory, not compressing" );
+        $logger->warn("$maildir has no 'tmp' subdirectory, not compressing");
         return;
     }
 
@@ -335,10 +351,10 @@ sub maildir_check {
     if ( !-f catfile( $maildir, 'dovecot-uidlist' ) ) {
 
         # Suspicious, but not fatal.
-        $logger->log( $INFO, "$maildir does not contain a dovecot-uidlist file" );
+        $logger->info("$maildir does not contain a dovecot-uidlist file");
     }
 
-    $logger->log( $DEBUG, "$maildir looks like a Maildir" );
+    $logger->debug("$maildir looks like a Maildir");
     return 1;
 }
 
@@ -357,7 +373,7 @@ sub maildir_lock {
     my $pid = open3( $cmd_input, $cmd_output, $cmd_error, $cmd );
 
     if ( waitpid( $pid, 0 ) != $pid ) {
-        $logger->log( $ERROR, "waiting for $pid, but it's already gone" );
+        $logger->error("waiting for $pid, but it's already gone");
         return;
     }
 
@@ -373,7 +389,7 @@ sub maildir_lock {
             $err = $err . $_;
         }
 
-        $logger->log( $WARN, "Can't get lock, $child_exit_status return from command: $cmd: $err" );
+        $logger->warn("Can't get lock, $child_exit_status return from command: $cmd: $err");
         return;
     }
 
@@ -385,7 +401,7 @@ sub maildir_lock {
 
     my ($pid_out) = $output =~ / \A (\d+) \z /msx;
     if ( !$pid_out ) {
-        $logger->log( $WARN, "Can't get PID from maildirlock output '$output'" );
+        $logger->warn("Can't get PID from maildirlock output '$output'");
         return;
     }
 
