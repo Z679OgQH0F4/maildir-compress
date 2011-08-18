@@ -235,7 +235,7 @@ sub email_compress {
 
     bzip2 $mailfile => $compressed_file, BlockSize100K => 6;
     if ( !$mailfile ) {
-        $logger->errir("Unable to create compressed file: $Bzip2Error");
+        $logger->error("Unable to create compressed file: $Bzip2Error");
         return;
     }
 
