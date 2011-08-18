@@ -161,9 +161,13 @@ sub email_compress {
 
     my ( $volume, $directories, $file ) = File::Spec->splitpath($mailfile);
 
-    my ( $name_no_flags, $flags ) = $file =~ / ([^:]+) :2, (.*) /msx;
+    my ( $time, $id, $host_plus, $vers, $flags )
+        = $file =~ / ([^\.]*) . ([^\.]*) . ([^:]*) (:2,)? (.*) /msx;
+    if ( !$vers ) {
+        $vers = q{};
+    }
 
-    if ( !$name_no_flags ) {
+    if ( !$time or !$id or !$host_plus ) {
         $logger->warn("unable to parse $file as a maildir file name, not compressing");
         return;
     }
@@ -188,7 +192,7 @@ sub email_compress {
     }
 
     my $size;
-    if ( $name_no_flags =~ / ,S=(\d+) /msx ) {
+    if ( $host_plus =~ / ,S=(\d+) /msx ) {
         $size = $1;
         if ( $size > $sz ) {    # Probably already compressed in some unknown way?
             $logger->warn("actual size of $sz is less than S=n size of $size, not compressing");
@@ -199,8 +203,9 @@ sub email_compress {
         $size = $sz;
 
         # rename the file to include the size...
-        my $newmailfile
-            = catfile( $volume, $directories, $name_no_flags . ',S=' . $size . ':2,' . $flags );
+        my $newmailfile = catfile( $volume, $directories,
+            "$time.$id.$host_plus" . ',S=' . $size . "$vers$flags" );
+
         if ( !rename $mailfile, $newmailfile ) {
             $logger->error("unable to rename $mailfile to $newmailfile: $OS_ERROR");
             return;
