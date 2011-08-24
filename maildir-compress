@@ -19,11 +19,14 @@ use warnings;
 use Carp;
 use Config;
 use English qw( -no_match_vars );
-use Fcntl qw(:mode);
+use Fcntl qw(:mode SEEK_SET);
 use File::Spec::Functions;
 use File::Temp qw( tempdir );
 use Getopt::Long;
 use IO::Compress::Bzip2 qw(bzip2 $Bzip2Error);
+use IO::Compress::Gzip qw(gzip $GzipError);
+use IO::Uncompress::Bunzip2 qw(bunzip2 $Bunzip2Error);
+use IO::Uncompress::Gunzip qw(gunzip $GunzipError);
 use IPC::Open3 qw(open3);
 use Log::Log4perl;
 use Readonly;
@@ -40,24 +43,41 @@ my $log_conf = q(
     log4perl.rootLogger                = DEBUG, SCREEN, SYSLOG
 
     log4perl.appender.SCREEN           = Log::Log4perl::Appender::Screen
+    log4perl.appender.SCREEN.min_level = WARN
     log4perl.appender.SCREEN.stderr    = 0
     log4perl.appender.SCREEN.layout    = Log::Log4perl::Layout::PatternLayout
-    log4perl.appender.SCREEN.layout.ConversionPattern = %p %F:%L: %d{yyyy-MM-dd HH:mm:ss.SSSZ} %m %n
+    log4perl.appender.SCREEN.layout.ConversionPattern = %d{yyyy-MM-dd HH:mm:ss.SSSZ} %p %F:%L: %m %n
 
     log4perl.appender.SYSLOG           = Log::Dispatch::Syslog
-    log4perl.appender.SYSLOG.min_level = debug
+    log4perl.appender.SYSLOG.min_level = WARN
     log4perl.appender.SYSLOG.ident     = maildir-compress
     log4perl.appender.SYSLOG.facility  = daemon
     log4perl.appender.SYSLOG.layout    = Log::Log4perl::Layout::PatternLayout
-    log4perl.appender.SYSLOG.layout.ConversionPattern = %p %m
+    log4perl.appender.SYSLOG.layout.ConversionPattern = %p %F:%L: %m
 );
 
 Log::Log4perl::init( \$log_conf );
 my $logger = Log::Log4perl->get_logger();
 
-my $block_size = 0;    # To override the block size returned by stat(2).
+Readonly my $BZIP2        => 'bzip2';
+Readonly my $GZIP         => 'gzip';
+Readonly my $UNCOMPRESSED => 'uncompressed';
 
-my $result = GetOptions( 'block-size=i' => \$block_size, );
+my @allowed_compress_types = ( $BZIP2, $GZIP, $UNCOMPRESSED );
+
+my $block_size    = 0;        # To override the block size returned by stat(2).
+my $compress_type = $GZIP;    # Easy on the CPUs with reasonable compression.
+
+my $result = GetOptions(
+    'block-size=i'    => \$block_size,
+    'compress-type=s' => \$compress_type,
+);
+
+if ( !grep { $_ eq $compress_type } @allowed_compress_types ) {
+    $logger->error(
+        "$compress_type is not one of the supported compression types: @allowed_compress_types");
+    exit 1;
+}
 
 my $exit_status = 0;
 
@@ -75,7 +95,7 @@ sub maildir_compress {
     my $maildir = shift;
 
     if ( !maildir_check($maildir) ) {
-        $logger->warn("$maildir does not seem to be a valid maildir, not compressing");
+        $logger->warn("$maildir does not seem to be a valid maildir, skipping");
         return;
     }
 
@@ -106,7 +126,7 @@ sub maildir_compress {
 
             my $subdir = catfile( $maildir, $df );
 
-            # skip non-directories
+            # Skip non-directories.
             if ( !-d $subdir ) {
                 $logger->debug("skipping non-directory $subdir");
                 next;
@@ -118,37 +138,25 @@ sub maildir_compress {
         closedir $mdh;
     }
 
-    # for each (email) file in maildir/cur
-    my $cur = catfile( $maildir, 'cur' );
-    my $cdh;
-    if ( !opendir $cdh, $cur ) {
-        $logger->error("opendir failed for $cur");
-        return;
-    }
-    while ( my $mf = readdir $cdh ) {
-        if ( ( $mf eq q{.} ) or ( $mf eq q{..} ) ) {
+    # For each (email) file in new, cur
+
+    foreach my $subdir ( 'new', 'cur' ) {
+
+        my $sub = catfile( $maildir, $subdir );
+        my $dh;
+        if ( !opendir $dh, $sub ) {
+            $logger->error("opendir failed for $subdir");
             next;
         }
+        while ( my $mf = readdir $dh ) {
+            if ( ( $mf eq q{.} ) or ( $mf eq q{..} ) ) {
+                next;
+            }
 
-        email_compress( catfile( $cur, $mf ), $maildir );
-    }
-    closedir $cdh;
-
-    # for each (email) file in maildir/new
-    my $new = catfile( $maildir, 'new' );
-    my $ndh;
-    if ( !opendir $ndh, $new ) {
-        $logger->error("opendir failed for $new");
-        return;
-    }
-    while ( my $mf = readdir $ndh ) {
-        if ( ( $mf eq q{.} ) or ( $mf eq q{..} ) ) {
-            next;
+            email_compress( catfile( $sub, $mf ), $maildir );
         }
-
-        email_compress( catfile( $new, $mf ), $maildir );
+        closedir $dh;
     }
-    closedir $ndh;
 
     return 1;
 }
@@ -168,7 +176,7 @@ sub email_compress {
     }
 
     if ( !$time or !$id or !$host_plus ) {
-        $logger->warn("unable to parse $file as a maildir file name, not compressing");
+        $logger->warn("unable to parse $file as a maildir file name, skipping");
         return;
     }
 
@@ -186,27 +194,59 @@ sub email_compress {
         return;
     }
 
-    # If the file is already compressed or otherwise unreadable, skip
-    # it.  This must be done before we add in the S=<nn> to the file
-    # name since that's supposed to represent the uncompressed size.
-    if ( is_compressed($mailfile) ) {
+    # Open the file in "binary" mode
+    my $fh;
+    if ( !open $fh, '<', $mailfile ) {
+        $logger->error("Can't open $mailfile: $OS_ERROR");
+        return 1;
+    }
+    binmode $fh;
+
+    # Read the "magic" numbers to see what compression (if any) format it's in.
+    my $magic;
+    if ( !sysread $fh, $magic, 2 ) {
+        $logger->error("Can't read magic number from $mailfile: $OS_ERROR");
+        return 1;
+    }
+
+    # Seek back to the start of the file so read_existing can use the same file handle.
+    if ( !sysseek $fh, 0, SEEK_SET ) {
+        $logger->error("Can't seek to start of $mailfile: $OS_ERROR");
+        return 1;
+    }
+
+    my $current_compress_type = $UNCOMPRESSED;
+
+    if ( $magic eq 'BZ' ) {
+        $current_compress_type = $BZIP2;    # File is Bzip2 compressed.
+    }
+    if ( $magic eq "\x1f\x8b" ) {
+        $current_compress_type = $GZIP;     # File is gzip compressed.
+    }
+
+    # If the file is already of the correct type, skip it
+    if ( $current_compress_type eq $compress_type ) {
+        $logger->info("$mailfile is already $compress_type");
         return;
     }
 
     my $size;
-    if ( $host_plus =~ / ,S=(\d+) /msx ) {
+    if ( $host_plus =~ / ,S=(\d+) /msx ) {    # Get the size from the file name.
         $size = $1;
-        if ( $size > $sz ) {    # Probably already compressed in some unknown way?
+
+        # Probably already compressed in some unknown way?
+        if ( ($size > $sz) and ($current_compress_type eq $UNCOMPRESSED) ) {
             $logger->warn("actual size of $sz is less than S=n size of $size, not compressing");
             return;
         }
     }
-    else {
+    elsif ( $compress_type ne $UNCOMPRESSED ) {
         $size = $sz;
 
-        # rename the file to include the size...
-        my $newmailfile = catfile( $volume, $directories,
-            "$time.$id.$host_plus" . ',S=' . $size . "$vers$flags" );
+        # Size not in file name, so if we're compressing we need to
+        # rename the file to include the size.
+        $file = "$time.$id.$host_plus" . ',S=' . $size . "$vers$flags";
+        my $newmailfile = catfile( $volume, $directories, $file );
 
         if ( !rename $mailfile, $newmailfile ) {
             $logger->error("unable to rename $mailfile to $newmailfile: $OS_ERROR");
@@ -214,18 +254,19 @@ sub email_compress {
         }
         $logger->info("renamed '$mailfile' to '$newmailfile'");
         $mailfile = $newmailfile;
-        ( $volume, $directories, $file ) = File::Spec->splitpath($newmailfile);
     }
 
-    # Check that compressing this file is worth it at all
-    if ( $block_size == 0 ) {
-        $block_size = $blksize;
-    }
-    if ( $size <= $block_size ) {
-        $logger->info(
-            "$mailfile size of $size is less than the file system block size $block_size, not compressing"
-        );
-        return;
+    # Check that compressing this file is worth it at all.
+    if ( $compress_type ne $UNCOMPRESSED ) {
+        if ( $block_size == 0 ) {
+            $block_size = $blksize;
+        }
+        if ( $size <= $block_size ) {
+            $logger->info(
+                "$mailfile size of $size is less than the file system block size $block_size, not compressing"
+            );
+            return;
+        }
     }
 
     my $tempdir = tempdir(
@@ -238,25 +279,32 @@ sub email_compress {
         return;
     }
 
-    my $compressed_file = catfile( $tempdir, $file );
+    my $output_file_name = catfile( $tempdir, $file );
 
-    bzip2 $mailfile => $compressed_file, BlockSize100K => 6;
-    if ( !$mailfile ) {
-        $logger->error("Unable to create compressed file: $Bzip2Error");
+    # At this point, slurp in the existing file data
+
+    my $file_data;
+    eval { read_existing( $current_compress_type, $mailfile, \$file_data, $fh, $sz ); };
+    if ($EVAL_ERROR) {
+        $logger->error("unable to read $mailfile: $EVAL_ERROR");
+        return;
+    }
+    eval { write_newfile( $compress_type, $output_file_name, \$file_data ) };
+    if ($EVAL_ERROR) {
+        $logger->error("unable to write $output_file_name: $EVAL_ERROR");
         return;
     }
 
-    # set owner, mode and times on $compressed_file
-
-    if ( !chown $uid, $gid, $compressed_file ) {
+    # set owner, mode and times on $output_file_name
+    if ( !chown $uid, $gid, $output_file_name ) {
         $logger->error("Unable to chown $mailfile: $OS_ERROR");
         return;
     }
-    if ( !chmod $mode, $compressed_file ) {
+    if ( !chmod $mode, $output_file_name ) {
         $logger->error("Unable to chmod $mailfile: $OS_ERROR");
         return;
     }
-    if ( !utime $atime, $mtime, $compressed_file ) {
+    if ( !utime $atime, $mtime, $output_file_name ) {
         $logger->error("Unable to utime $mailfile: $OS_ERROR");
         return;
     }
@@ -264,10 +312,9 @@ sub email_compress {
     # Lock the maildir
     my $pid = maildir_lock($maildir);
     if ( !$pid ) {
-        $logger->error("$maildir can't be locked, not compressing $mailfile");
+        $logger->warn("$maildir can't be locked, skipping $mailfile");
         return;
     }
-
     $logger->debug("successfully locked $maildir, pid $pid");
 
     # After this point, we must kill the process holding the lock before we return.
@@ -276,11 +323,11 @@ sub email_compress {
         $logger->warn("original mailfile $mailfile is now gone, skipping");
     }
     else {
-        if ( !rename $compressed_file, $mailfile ) {
-            $logger->error("unable to rename $compressed_file to $mailfile: $OS_ERROR");
+        if ( !rename $output_file_name, $mailfile ) {
+            $logger->error("unable to rename $output_file_name to $mailfile: $OS_ERROR");
         }
         else {
-            $logger->info("$mailfile is now compressed");
+            $logger->info("$mailfile is now $compress_type");
         }
     }
 
@@ -292,37 +339,62 @@ sub email_compress {
     }
 }
 
-# Check a file to see if it's compressed already, or otherwise inaccessible.
+sub read_existing {
+    my $compress_type = shift;
+    my $mailfile      = shift;
+    my $buffer        = shift;
+    my $fh            = shift;
+    my $sz            = shift;
 
-sub is_compressed {
-    my $mailfile = shift;
-
-    my $fh;
-    if ( !open $fh, '<', $mailfile ) {
-        $logger->error("Can't open $mailfile: $OS_ERROR");
-        return 1;
-    }
-    binmode $fh;
-
-    my $magic;
-    if ( !sysread $fh, $magic, 2 ) {
-        $logger->error("Can't read magic number from $mailfile: $OS_ERROR");
-        return 1;
+    if ( $compress_type eq $BZIP2 ) {
+        bunzip2 $mailfile => $buffer
+            or croak "Unable to read bzip2 compressed file $mailfile: $Bzip2Error";
+        return;
     }
 
-    # File is Bzip2 compressed, so our work is done
-    if ( $magic eq 'BZ' ) {
-        $logger->info("Skipping bzip compressed file $mailfile");
-        return 1;
+    if ( $compress_type eq $GZIP ) {
+        gunzip $mailfile => $buffer
+            or croak "Unable to read gzip compressed file $mailfile: $GunzipError";
+        return;
     }
 
-    # File is gzip compressed, so our work is done
-    if ( $magic eq "\x1f\x8b" ) {
-        $logger->info("Skipping gzip compressed file $mailfile");
-        return 1;
+    if ( $compress_type eq $UNCOMPRESSED ) {
+        sysread $fh, $$buffer, $sz
+            or croak "Can't read plain file $mailfile: $OS_ERROR";
+        return;
     }
 
-    return;
+    $logger->error("Unknown compression type $compress_type");
+}
+
+sub write_newfile {
+    my $compress_type = shift;
+    my $mailfile      = shift;
+    my $buffer        = shift;
+
+    if ( $compress_type eq $BZIP2 ) {
+        bzip2 $buffer => $mailfile
+            or croak "Unable to write bzip2 compressed file $mailfile: $Bzip2Error";
+    }
+
+    if ( $compress_type eq $GZIP ) {
+        gzip $buffer => $mailfile
+            or croak "Unable to write gzip compressed file $mailfile: $GunzipError";
+    }
+
+    if ( $compress_type eq $UNCOMPRESSED ) {
+        my $fh;
+        if ( !open $fh, '>', $mailfile ) {
+            $logger->error("Can't open $mailfile: $OS_ERROR");
+            return 1;
+        }
+        binmode $fh;
+        if ( !syswrite $fh, $$buffer ) {
+            $logger->error("Can't write to $mailfile: $OS_ERROR");
+            return 1;
+        }
+        close $fh;
+    }
 }
 
 # Make sure this maildir looks like a real (dovecot) maildir.
@@ -338,15 +410,15 @@ sub maildir_check {
     # Check for cur, new and tmp subdirectories
 
     if ( !-d catfile( $maildir, 'cur' ) ) {
-        $logger->warn("$maildir has no 'cur' subdirectory, not compressing");
+        $logger->warn("$maildir has no 'cur' subdirectory, skipping");
         return;
     }
     if ( !-d catfile( $maildir, 'new' ) ) {
-        $logger->warn("$maildir has no 'new' subdirectory, not compressing");
+        $logger->warn("$maildir has no 'new' subdirectory, skipping");
         return;
     }
     if ( !-d catfile( $maildir, 'tmp' ) ) {
-        $logger->warn("$maildir has no 'tmp' subdirectory, not compressing");
+        $logger->warn("$maildir has no 'tmp' subdirectory, skipping");
         return;
     }
 

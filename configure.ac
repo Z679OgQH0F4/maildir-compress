@@ -1,10 +1,7 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-# $URL: https://svn.mediatemple.net/dev/apps/maildir-compress/configure.ac $
-# $Id: configure.ac 127582 2011-08-12 20:54:51Z gene $
-
-AC_INIT([mt-maildir-compress], [0.9], [Media Temple <dev@mediatemple.net>])
+AC_INIT([mt-maildir-compress], [0.10], [Media Temple <dev@mediatemple.net>])
 AM_INIT_AUTOMAKE([foreign])
 AC_CONFIG_SRCDIR([maildir-compress])
 
