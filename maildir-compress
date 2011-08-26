@@ -24,7 +24,7 @@ use File::Spec::Functions;
 use File::Temp qw( tempdir );
 use Getopt::Long;
 use IO::Compress::Bzip2 qw(bzip2 $Bzip2Error);
-use IO::Compress::Gzip qw(gzip $GzipError);
+use IO::Compress::Gzip qw(gzip $GzipError Z_BEST_COMPRESSION);
 use IO::Uncompress::Bunzip2 qw(bunzip2 $Bunzip2Error);
 use IO::Uncompress::Gunzip qw(gunzip $GunzipError);
 use IPC::Open3 qw(open3);
@@ -40,16 +40,16 @@ my %signo;
 
 # Initialize Logger
 my $log_conf = q(
-    log4perl.rootLogger                = DEBUG, SCREEN, SYSLOG
+    log4perl.rootLogger                = WARN, SCREEN, SYSLOG
 
     log4perl.appender.SCREEN           = Log::Log4perl::Appender::Screen
-    log4perl.appender.SCREEN.min_level = WARN
+    log4perl.appender.SCREEN.min_level = warn
     log4perl.appender.SCREEN.stderr    = 0
     log4perl.appender.SCREEN.layout    = Log::Log4perl::Layout::PatternLayout
     log4perl.appender.SCREEN.layout.ConversionPattern = %d{yyyy-MM-dd HH:mm:ss.SSSZ} %p %F:%L: %m %n
 
     log4perl.appender.SYSLOG           = Log::Dispatch::Syslog
-    log4perl.appender.SYSLOG.min_level = WARN
+    log4perl.appender.SYSLOG.min_level = warn
     log4perl.appender.SYSLOG.ident     = maildir-compress
     log4perl.appender.SYSLOG.facility  = daemon
     log4perl.appender.SYSLOG.layout    = Log::Log4perl::Layout::PatternLayout
@@ -235,7 +235,7 @@ sub email_compress {
         $size = $1;
 
         # Probably already compressed in some unknown way?
-        if ( ($size > $sz) and ($current_compress_type eq $UNCOMPRESSED) ) {
+        if ( ( $size > $sz ) and ( $current_compress_type eq $UNCOMPRESSED ) ) {
             $logger->warn("actual size of $sz is less than S=n size of $size, not compressing");
             return;
         }
@@ -373,12 +373,14 @@ sub write_newfile {
     my $buffer        = shift;
 
     if ( $compress_type eq $BZIP2 ) {
-        bzip2 $buffer => $mailfile
+        bzip2 $buffer     => $mailfile,
+            BlockSize100K => 6
             or croak "Unable to write bzip2 compressed file $mailfile: $Bzip2Error";
     }
 
     if ( $compress_type eq $GZIP ) {
-        gzip $buffer => $mailfile
+        gzip $buffer => $mailfile,
+            Level    => Z_BEST_COMPRESSION
             or croak "Unable to write gzip compressed file $mailfile: $GunzipError";
     }
 
