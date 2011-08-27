@@ -1,7 +1,7 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-AC_INIT([mt-maildir-compress], [0.11], [Media Temple <dev@mediatemple.net>])
+AC_INIT([mt-maildir-compress], [0.12], [Media Temple <dev@mediatemple.net>])
 AM_INIT_AUTOMAKE([foreign])
 AC_CONFIG_SRCDIR([maildir-compress])
 
