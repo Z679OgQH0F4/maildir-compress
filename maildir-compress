@@ -29,6 +29,7 @@ use IO::Uncompress::Bunzip2 qw(bunzip2 $Bunzip2Error);
 use IO::Uncompress::Gunzip qw(gunzip $GunzipError);
 use IPC::Open3 qw(open3);
 use Log::Log4perl;
+use Pod::Usage;
 use Readonly;
 
 # More or less #include <signal.h>
@@ -67,11 +68,17 @@ my @allowed_compress_types = ( $BZIP2, $GZIP, $UNCOMPRESSED );
 
 my $block_size    = 0;        # To override the block size returned by stat(2).
 my $compress_type = $GZIP;    # Easy on the CPUs with reasonable compression.
+my $help          = 0;
+my $man           = 0;
 
 my $result = GetOptions(
     'block-size=i'    => \$block_size,
     'compress-type=s' => \$compress_type,
+    'help|?'          => \$help,
+    man               => \$man,
 );
+pod2usage(1) if $help;
+pod2usage( -exitstatus => 0, -verbose => 2 ) if $man;
 
 if ( !grep { $_ eq $compress_type } @allowed_compress_types ) {
     $logger->error(
@@ -485,3 +492,47 @@ sub maildir_lock {
 
     return $pid_out;
 }
+
+__END__
+
+=head1 NAME
+
+maildir-compress - Compress or uncompress email files in a Dovecot maildir.
+
+=head1 SYNOPSIS
+
+maildir-compress [options] [maildir ...]
+Options:
+
+--block-size
+
+--compress-type
+
+--help
+
+--man
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--block-size>
+Override the block size returned by stat.
+
+=item B<--compress-type>
+One of gzip, bzip2 or uncompressed.
+
+=item B<--help>
+Print a brief help message and exits.
+
+=item B<--man>
+Prints the manual page and exits.
+
+=back
+
+=head1 DESCRIPTION
+
+This script will read the given maildirs and make all files larger
+than a block compressed.
+
+=cut
