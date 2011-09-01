@@ -502,15 +502,6 @@ maildir-compress - Compress or uncompress email files in a Dovecot maildir.
 =head1 SYNOPSIS
 
 maildir-compress [options] [maildir ...]
-Options:
-
---block-size
-
---compress-type
-
---help
-
---man
 
 =head1 OPTIONS
 
@@ -534,5 +525,9 @@ Prints the manual page and exits.
 
 This script will read the given maildirs and make all files larger
 than a block compressed.
+
+For example:
+
+# nohup /opt/mt/bin/maildir-compress /home/n0?/*/users/*/Maildir
 
 =cut
