@@ -6,5 +6,5 @@ package: dist
 	make check
 	make dist
 	mkdir -p rpm/{SOURCES,BUILD,RPMS}
-	mv mt-maildir-compress-@PACKAGE_VERSION@*.gz rpm/SOURCES
+	mv maildir-compress-@PACKAGE_VERSION@*.gz rpm/SOURCES
 	rpmbuild -bb REDHAT.spec
